@@ -2,15 +2,22 @@
 #ifndef _RISCV_PROCESSOR_H
 #define _RISCV_PROCESSOR_H
 
-#include "decode.h"
-#include "config.h"
-#include "devices.h"
-#include "trap.h"
 #include <string>
 #include <vector>
 #include <map>
 #include <cassert>
 #include "debug_rom_defines.h"
+#include <queue> //BORJA
+#include <memory>
+#include <unordered_map>
+
+#include "decode.h"
+#include "config.h"
+#include "devices.h"
+#include "trap.h"
+
+#include "L2Request.hpp"
+#include <list>
 
 class processor_t;
 class mmu_t;
@@ -161,6 +168,7 @@ class vectorUnit_t {
   public:
     processor_t* p;
     void *reg_file;
+    void *dummy_reg;
     char reg_referenced[NVPR];
     int setvl_count;
     reg_t reg_mask, vlmax, vmlen;
@@ -183,21 +191,38 @@ class vectorUnit_t {
 	n ^= elts_per_reg - 1;
 #endif
         reg_referenced[vReg] = 1;
-
         T *regStart = (T*)((char*)reg_file + vReg * (VLEN >> 3));
+
+        check_raw(vReg);
+
         return regStart[n];
       }
+
+  private:
+    uint64_t avail_cycle[NVPR]={0};
+    uint8_t pending_events[NVPR]={0};
+
+    void check_raw(reg_t vReg);
+
+    uint64_t get_avail_cycle(reg_t i)
+    {
+      return avail_cycle[i];
+    }
+
   public:
 
     void reset();
 
     vectorUnit_t(){
       reg_file = 0;
+      dummy_reg=0;
     }
 
     ~vectorUnit_t(){
       free(reg_file);
+      free(dummy_reg);
       reg_file = 0;
+      dummy_reg=0;
     }
 
     reg_t set_vl(int rd, int rs1, reg_t reqVL, reg_t newType);
@@ -209,6 +234,34 @@ class vectorUnit_t {
     VRM get_vround_mode() {
       return (VRM)vxrm;
     }
+
+
+    void set_avail(reg_t i, uint64_t cycle)
+    {
+      //if (!zero_reg || i != 0)
+      avail_cycle[i] = cycle;
+    }
+
+    bool ack_for_reg(reg_t i, uint64_t cycle)
+    {
+      bool res=false;
+      pending_events[i]--;
+      if(pending_events[i]==0)
+      {
+        set_avail(i, cycle);
+        res=true;
+      }
+      return res;
+    }
+
+    void set_event_dependent(reg_t i, uint8_t num_events)
+    {
+      pending_events[i]=num_events;
+      //if (!zero_reg || i != 0)
+      avail_cycle[i] = std::numeric_limits<uint64_t>::max();
+    }
+
+
 };
 
 // architectural state of a RISC-V hart
@@ -261,6 +314,11 @@ struct state_t
   uint32_t frm;
   bool serialized; // whether timer CSRs are in a well-defined state
 
+  bool raw=false;
+  std::list<size_t> * pending_int_regs;
+  std::list<size_t> * pending_float_regs;
+  std::list<size_t> * pending_vector_regs;
+
   // When true, execute a single instruction and then enter debug mode.  This
   // can only be set by executing dret.
   enum {
@@ -307,7 +365,7 @@ public:
   void set_log_commits(bool value);
   bool get_log_commits() { return log_commits_enabled; }
   void reset();
-  void step(size_t n); // run for n cycles
+  bool step(size_t n); // run for n cycles
   void set_csr(int which, reg_t val);
   reg_t get_csr(int which);
   mmu_t* get_mmu() { return mmu; }
@@ -433,13 +491,22 @@ public:
 
   void trigger_updated();
 
+  bool miss_log_enabled() {return log_misses;} //BORJA
+
+  void enable_miss_log() {log_misses=true;}
+
+  void set_current_cycle(uint64_t c){current_cycle=c;};
+  uint64_t get_current_cycle();
+
+  uint16_t get_id() {return id;}
+
 private:
   simif_t* sim;
   mmu_t* mmu; // main memory is always accessed via the mmu
   extension_t* ext;
   disassembler_t* disassembler;
   state_t state;
-  uint32_t id;
+  uint16_t id;
   unsigned max_xlen;
   unsigned xlen;
   reg_t max_isa;
@@ -475,9 +542,17 @@ private:
 
   // Track repeated executions for processor_t::disasm()
   uint64_t last_pc, last_bits, executions;
+ 
+  bool log_misses=false;
+
+  std::list<std::shared_ptr<spike_model::L2Request>> pending_misses;
+  uint64_t current_cycle;
+
+
 public:
   vectorUnit_t VU;
 };
+
 
 reg_t illegal_instruction(processor_t* p, insn_t insn, reg_t pc);
 

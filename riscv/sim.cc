@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <thread>
 
 volatile bool ctrlc_pressed = false;
 static void handle_signal(int sig)
@@ -31,7 +32,8 @@ sim_t::sim_t(const char* isa, const char* priv, const char* varch,
              std::vector<std::pair<reg_t, abstract_device_t*>> plugin_devices,
              const std::vector<std::string>& args,
              std::vector<int> const hartids,
-             const debug_module_config_t &dm_config)
+             const debug_module_config_t &dm_config
+             )
   : htif_t(args), mems(mems), plugin_devices(plugin_devices),
     procs(std::max(nprocs, size_t(1))), start_pc(start_pc), current_step(0),
     current_proc(0), debug(false), histogram_enabled(false),
@@ -50,6 +52,7 @@ sim_t::sim_t(const char* isa, const char* priv, const char* varch,
 
   debug_mmu = new mmu_t(this, NULL);
 
+
   if (hartids.size() == 0) {
     for (size_t i = 0; i < procs.size(); i++) {
       procs[i] = new processor_t(isa, priv, varch, this, i, halted);
@@ -67,6 +70,7 @@ sim_t::sim_t(const char* isa, const char* priv, const char* varch,
 
   clint.reset(new clint_t(procs));
   bus.add_device(CLINT_BASE, clint.get());
+  printf("Created\n");
 }
 
 sim_t::~sim_t()
@@ -91,19 +95,133 @@ void sim_t::main()
     if (debug || ctrlc_pressed)
       interactive();
     else
+    {
       step(INTERLEAVE);
+    }
     if (remote_bitbang) {
       remote_bitbang->tick();
     }
   }
+
+
+}
+
+bool sim_t::simulate_one(uint32_t core, uint64_t current_cycle, std::list<std::shared_ptr<spike_model::L2Request>>& l1Misses)
+{
+    bool res=false;
+    if(!done())
+    {
+        procs[core]->set_current_cycle(current_cycle);
+        res=my_step_one(core);
+        l1Misses=procs[core]->get_mmu()->get_misses();
+        //printf("Got %lu misses here\n", l1Misses.size());
+    }
+    else
+    {
+        res=true;
+        l1Misses.push_back(std::make_shared<spike_model::L2Request>(0, 0, spike_model::L2Request::AccessType::FINISH, current_cycle, core));
+    }
+    return res;
+}
+
+
+bool sim_t::ack_register(const std::shared_ptr<spike_model::L2Request> & req, uint64_t timestamp)
+{
+    bool ready;
+    switch(req->getRegType())
+    {
+        case spike_model::L2Request::RegType::INTEGER:
+            ready=procs[req->getCoreId()]->get_state()->XPR.ack_for_reg(req->getRegId(), timestamp);
+            // If all the requests for the register (vector instructions might require many) have been serviced, it is no longer pending
+            if(ready)
+            {
+                procs[req->getCoreId()]->get_state()->pending_int_regs->remove(req->getRegId());
+            }
+            break;
+        case spike_model::L2Request::RegType::FLOAT:
+            ready=procs[req->getCoreId()]->get_state()->FPR.ack_for_reg(req->getRegId(), timestamp);
+            // If all the requests for the register (vector instructions might require many) have been serviced, it is no longer pending
+            if(ready)
+            {
+                procs[req->getCoreId()]->get_state()->pending_float_regs->remove(req->getRegId());
+            }
+            break;
+        case spike_model::L2Request::RegType::VECTOR:
+            ready=procs[req->getCoreId()]->VU.ack_for_reg(req->getRegId(), timestamp);
+            // If all the requests for the register (vector instructions might require many) have been serviced, it is no longer pending
+            if(ready)
+            {
+                procs[req->getCoreId()]->get_state()->pending_vector_regs->remove(req->getRegId());
+            }
+            break;
+        default:
+            std::cout << "Unknown register kind!\n";
+            break;
+    }
+    //Simulation can resumen if there are no pending registers.
+    return procs[req->getCoreId()]->get_state()->pending_int_regs->size()==0 && procs[req->getCoreId()]->get_state()->pending_float_regs->size()==0 && procs[req->getCoreId()]->get_state()->pending_vector_regs->size()==0;
+}
+
+
+void htif_run_launcher(void* arg)
+{
+    ((sim_t*)arg)->htif_t::run();
+}
+
+/*
+Prepares the wrapped spike to wait for simulate requests. This is
+basically the opposite of the run function, in the sense that the 
+work that is done by each of the two threads is reversed. When
+executing in this mode, Spike debug mode is likely to not work.
+*/
+void sim_t::prepare()
+{
+  target = *context_t::current();
+
+  host=new context_t();
+  host->init(htif_run_launcher, this);
+
+  for(unsigned int i=0; i<procs.size();i++)
+  {
+      procs[i]->enable_miss_log();
+      procs[i]->get_mmu()->enable_miss_log();
+  }
+ 
+  host->switch_to();
 }
 
 int sim_t::run()
 {
   host = context_t::current();
   target.init(sim_thread_main, this);
-  return htif_t::run();
+
+  int res=htif_t::run();
+
+  return res;
 }
+
+
+/*
+Simulates a single instruction in the specified core.
+*/
+bool sim_t::my_step_one(size_t core)
+{
+    bool res=procs[core]->step(1);
+
+    current_step += 1;
+    if (current_step == INTERLEAVE*procs.size())
+    {
+      current_step = 0;
+
+      if(!done())
+      {
+        host->switch_to();
+      }
+    }
+    procs[core]->get_mmu()->yield_load_reservation();
+    return res;
+}
+
 
 void sim_t::step(size_t n)
 {
@@ -113,6 +231,7 @@ void sim_t::step(size_t n)
     procs[current_proc]->step(steps);
 
     current_step += steps;
+
     if (current_step == INTERLEAVE)
     {
       current_step = 0;
@@ -121,8 +240,11 @@ void sim_t::step(size_t n)
         current_proc = 0;
         clint->increment(INTERLEAVE / INSNS_PER_RTC_TICK);
       }
-
-      host->switch_to();
+        
+      if(!done())
+      {
+        host->switch_to();
+      }
     }
   }
 }

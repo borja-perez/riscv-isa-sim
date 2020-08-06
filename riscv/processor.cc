@@ -20,6 +20,7 @@
 #undef STATE
 #define STATE state
 
+
 processor_t::processor_t(const char* isa, const char* priv, const char* varch,
                          simif_t* sim, uint32_t id, bool halt_on_reset)
   : debug(false), halt_request(false), sim(sim), ext(NULL), id(id), xlen(0),
@@ -39,6 +40,9 @@ processor_t::processor_t(const char* isa, const char* priv, const char* varch,
       disassembler->add_insn(disasm_insn);
 
   reset();
+  get_state()->pending_int_regs=new std::list<size_t>();
+  get_state()->pending_float_regs=new std::list<size_t>();
+  get_state()->pending_vector_regs=new std::list<size_t>();
 }
 
 processor_t::~processor_t()
@@ -54,6 +58,9 @@ processor_t::~processor_t()
 
   delete mmu;
   delete disassembler;
+  delete get_state()->pending_int_regs;
+  delete get_state()->pending_float_regs;
+  delete get_state()->pending_vector_regs;
 }
 
 static void bad_isa_string(const char* isa)
@@ -229,10 +236,12 @@ void state_t::reset(reg_t max_isa)
 
 void vectorUnit_t::reset(){
   free(reg_file);
+  free(dummy_reg);
   VLEN = get_vlen();
   ELEN = get_elen();
   SLEN = get_slen(); // registers are simply concatenated
   reg_file = malloc(NVPR * (VLEN/8));
+  dummy_reg=malloc(VLEN/8);
 
   vtype = 0;
   set_vl(0, 0, 0, -1); // default to illegal configuration
@@ -269,6 +278,15 @@ reg_t vectorUnit_t::set_vl(int rd, int rs1, reg_t reqVL, reg_t newType){
   vstart = 0;
   setvl_count++;
   return vl;
+}
+    
+void vectorUnit_t::check_raw(reg_t vReg)
+{
+  if(get_avail_cycle(vReg)>p->get_current_cycle())
+  {
+    p->get_state()->raw=true;
+    p->get_state()->pending_vector_regs->push_back(vReg);
+  }
 }
 
 void processor_t::set_debug(bool value)
@@ -467,17 +485,23 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
 void processor_t::disasm(insn_t insn)
 {
   uint64_t bits = insn.bits() & ((1ULL << (8 * insn_length(insn.bits()))) - 1);
+  //printf("%d || %d\n", last_pc != state.pc, last_bits != bits);
   if (last_pc != state.pc || last_bits != bits) {
     if (executions != 1) {
       fprintf(stderr, "core %3d: Executed %" PRIx64 " times\n", id, executions);
     }
+    uint8_t opcode=(uint8_t)insn.bits();
+    opcode <<=1;
+    opcode >>=1;
 
     fprintf(stderr, "core %3d: 0x%016" PRIx64 " (0x%08" PRIx64 ") %s\n",
             id, state.pc, bits, disassembler->disassemble(insn).c_str());
+
     last_pc = state.pc;
     last_bits = bits;
     executions = 1;
   } else {
+    //printf("OUCH\n");
     executions++;
   }
 }
@@ -1078,3 +1102,9 @@ void processor_t::trigger_updated()
     }
   }
 }
+
+uint64_t processor_t::get_current_cycle()
+{
+  return current_cycle;
+}
+

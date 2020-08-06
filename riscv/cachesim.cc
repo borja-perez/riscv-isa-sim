@@ -121,7 +121,14 @@ uint64_t cache_sim_t::victimize(uint64_t addr)
   return victim;
 }
 
-void cache_sim_t::access(uint64_t addr, size_t bytes, bool store)
+uint64_t cache_sim_t::get_victim()
+{
+    uint64_t res=last_victim;
+    last_victim=0;
+    return res;
+}
+
+bool cache_sim_t::access(uint64_t addr, size_t bytes, bool store)
 {
   store ? write_accesses++ : read_accesses++;
   (store ? bytes_written : bytes_read) += bytes;
@@ -131,7 +138,7 @@ void cache_sim_t::access(uint64_t addr, size_t bytes, bool store)
   {
     if (store)
       *hit_way |= DIRTY;
-    return;
+    return true;
   }
 
   store ? write_misses++ : read_misses++;
@@ -142,7 +149,7 @@ void cache_sim_t::access(uint64_t addr, size_t bytes, bool store)
               << std::hex << addr << std::endl;
   }
 
-  uint64_t victim = victimize(addr);
+  uint64_t victim=victimize(addr);
 
   if ((victim & (VALID | DIRTY)) == (VALID | DIRTY))
   {
@@ -150,6 +157,7 @@ void cache_sim_t::access(uint64_t addr, size_t bytes, bool store)
     if (miss_handler)
       miss_handler->access(dirty_addr, linesz, true);
     writebacks++;
+    last_victim=victim;
   }
 
   if (miss_handler)
@@ -157,6 +165,8 @@ void cache_sim_t::access(uint64_t addr, size_t bytes, bool store)
 
   if (store)
     *check_tag(addr) |= DIRTY;
+
+  return false;
 }
 
 fa_cache_sim_t::fa_cache_sim_t(size_t ways, size_t linesz, const char* name)

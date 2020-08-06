@@ -1,9 +1,10 @@
 // See LICENSE for license details.
 
 #include "processor.h"
-#include "mmu.h"
 #include <cassert>
+#include <bitset>
 
+#include "mmu.h"
 
 static void commit_log_stash_privilege(processor_t* p)
 {
@@ -97,6 +98,7 @@ static reg_t execute_insn(processor_t* p, reg_t pc, insn_fetch_t fetch)
     }
     p->update_histogram(pc);
   }
+
   return npc;
 }
 
@@ -106,7 +108,8 @@ bool processor_t::slow_path()
 }
 
 // fetch/decode/execute loop
-void processor_t::step(size_t n)
+//Modified to return whether a RAW was detected or not
+bool processor_t::step(size_t n)
 {
   if (!state.debug_mode) {
     if (halt_request) {
@@ -116,6 +119,11 @@ void processor_t::step(size_t n)
       enter_debug_mode(DCSR_CAUSE_HALT);
     }
   }
+  
+  if(get_mmu()->num_pending_misses()>0)
+  {
+    get_mmu()->clear_misses();
+  }
 
   while (n > 0) {
     size_t instret = 0;
@@ -123,19 +131,19 @@ void processor_t::step(size_t n)
     mmu_t* _mmu = mmu;
 
     #define advance_pc() \
-     if (unlikely(invalid_pc(pc))) { \
-       switch (pc) { \
-         case PC_SERIALIZE_BEFORE: state.serialized = true; break; \
-         case PC_SERIALIZE_AFTER: ++instret; break; \
-         case PC_SERIALIZE_WFI: n = ++instret; break; \
-         default: abort(); \
-       } \
-       pc = state.pc; \
-       break; \
-     } else { \
-       state.pc = pc; \
-       instret++; \
-     }
+    if (unlikely(invalid_pc(pc))) { \
+        switch (pc) { \
+            case PC_SERIALIZE_BEFORE: state.serialized = true; break; \
+            case PC_SERIALIZE_AFTER: ++instret; break; \
+            case PC_SERIALIZE_WFI: n = ++instret; break; \
+            default: abort(); \
+        } \
+            pc = state.pc; \
+            break; \
+    } else { \
+            state.pc = pc; \
+            instret++; \
+    } 
 
     try
     {
@@ -160,7 +168,9 @@ void processor_t::step(size_t n)
 
           insn_fetch_t fetch = mmu->load_insn(pc);
           if (debug && !state.serialized)
+          {
             disasm(fetch.insn);
+          }
           pc = execute_insn(this, pc, fetch);
           advance_pc();
         }
@@ -267,4 +277,7 @@ void processor_t::step(size_t n)
     state.minstret += instret;
     n -= instret;
   }
+  bool res=!get_state()->raw;
+  get_state()->raw=false;
+  return res;
 }

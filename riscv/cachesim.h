@@ -9,6 +9,9 @@
 #include <map>
 #include <cstdint>
 
+#include <queue>
+#include <memory>
+
 class lfsr_t
 {
  public:
@@ -26,12 +29,14 @@ class cache_sim_t
   cache_sim_t(const cache_sim_t& rhs);
   virtual ~cache_sim_t();
 
-  void access(uint64_t addr, size_t bytes, bool store);
+  bool access(uint64_t addr, size_t bytes, bool store);
   void print_stats();
   void set_miss_handler(cache_sim_t* mh) { miss_handler = mh; }
   void set_log(bool _log) { log = _log; }
 
   static cache_sim_t* construct(const char* config, const char* name);
+
+  uint64_t get_victim();
 
  protected:
   static const uint64_t VALID = 1ULL << 63;
@@ -60,6 +65,7 @@ class cache_sim_t
 
   std::string name;
   bool log;
+  uint64_t last_victim=0;
 
   void init();
 };
@@ -74,6 +80,7 @@ class fa_cache_sim_t : public cache_sim_t
   static bool cmp(uint64_t a, uint64_t b);
   std::map<uint64_t, uint64_t> tags;
 };
+
 
 class cache_memtracer_t : public memtracer_t
 {
@@ -95,8 +102,10 @@ class cache_memtracer_t : public memtracer_t
     cache->set_log(log);
   }
 
+
  protected:
   cache_sim_t* cache;
+
 };
 
 class icache_sim_t : public cache_memtracer_t
@@ -107,9 +116,16 @@ class icache_sim_t : public cache_memtracer_t
   {
     return type == FETCH;
   }
-  void trace(uint64_t addr, size_t bytes, access_type type)
+  bool trace(uint64_t addr, size_t bytes, access_type type, bool& hit, uint64_t& victim)
   {
-    if (type == FETCH) cache->access(addr, bytes, false);
+    bool res=false;
+    victim=0;
+    if (type == FETCH)
+    {
+        res=true;
+        hit=cache->access(addr, bytes, false);
+    }
+    return res;
   }
 };
 
@@ -121,9 +137,18 @@ class dcache_sim_t : public cache_memtracer_t
   {
     return type == LOAD || type == STORE;
   }
-  void trace(uint64_t addr, size_t bytes, access_type type)
+  
+  bool trace(uint64_t addr, size_t bytes, access_type type, bool& hit, uint64_t& victim)
   {
-    if (type == LOAD || type == STORE) cache->access(addr, bytes, type == STORE);
+    bool res=false;
+    victim=0;
+    if (type == LOAD || type == STORE)
+    {
+        res=true;
+        hit=cache->access(addr, bytes, type == STORE);
+        victim=cache->get_victim();
+    }
+    return res;
   }
 };
 
