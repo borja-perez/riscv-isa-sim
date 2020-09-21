@@ -196,7 +196,6 @@ namespace spike_model
     */
     void SpikeWrapper::start_spike(int argc, const char** argv)
     {
-        printf("Am I silly??????\n");
         bool debug = false;
         bool halted = false;
         bool histogram = false;
